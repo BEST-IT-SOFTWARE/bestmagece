@@ -50,6 +50,8 @@ class Cm_Cache_Backend_Redis extends Zend_Cache_Backend implements Zend_Cache_Ba
     const FIELD_TAGS      = 't';
     const FIELD_INF       = 'i';
 
+	const STALE = "STALE";
+    const LOCK = "LOCK";
     const MAX_LIFETIME    = 2592000; /* Redis backend limit */
     const COMPRESS_PREFIX = ":\x1f\x8b";
     const DEFAULT_CONNECT_TIMEOUT = 2.5;
@@ -61,7 +63,7 @@ class Cm_Cache_Backend_Redis extends Zend_Cache_Backend implements Zend_Cache_Ba
 
     /** @var Credis_Client */
     protected $_redis;
-
+	protected $pipe_count = 0;
     /** @var bool */
     protected $_notMatchingTags = FALSE;
 
@@ -193,7 +195,7 @@ class Cm_Cache_Backend_Redis extends Zend_Cache_Backend implements Zend_Cache_Ba
      * @param  boolean $doNotTestCacheValidity If set to true, the cache validity won't be tested
      * @return bool|string
      */
-    public function load($id, $doNotTestCacheValidity = false)
+    public function _load($id, $doNotTestCacheValidity = false)
     {
         $data = $this->_redis->hGet(self::PREFIX_KEY.$id, self::FIELD_DATA);
         if ($data === NULL) {
@@ -201,6 +203,23 @@ class Cm_Cache_Backend_Redis extends Zend_Cache_Backend implements Zend_Cache_Ba
         }
         return $this->_decodeData($data);
     }
+	public function load($id, $doNotTestCacheValidity = false, $doNotUnserialize = false){
+        if (isset($this->locks[$id."-".self::LOCK])) {return false;}
+        $data = $this->_load($id, $doNotTestCacheValidity, $doNotUnserialize);
+        if ($data) {return $data; }//Data is cached, returning...
+        $data_stale = $this->_load($id."-".self::STALE, $doNotTestCacheValidity, $doNotUnserialize);
+        if (!$data_stale) {return false; }//No stale data was found.
+        $lock = $this->lock($id."-".self::LOCK, 120); //Ok, need to refresh data. Can I get the lock?
+        if ($lock) {
+            return false; //Got the lock, regen the data
+        } else {
+           
+            return $data_stale; //Someone else got the lock, return stale data
+        }
+
+
+    }
+
 
     /**
      * Test if a cache is available or not (for the given id)
@@ -227,80 +246,17 @@ class Cm_Cache_Backend_Redis extends Zend_Cache_Backend implements Zend_Cache_Ba
      * @throws CredisException
      * @return boolean True if no problem
      */
-    public function save($data, $id, $tags = array(), $specificLifetime = false)
+	public function _save($data, $id, $tags = array(), $specificLifetime = false)
     {
-        if(!is_array($tags))
-            $tags = $tags ? array($tags) : array();
-        else
-            $tags = array_flip(array_flip($tags));
+         if ( ! is_array($tags)) $tags = array($tags);
 
         $lifetime = $this->getLifetime($specificLifetime);
-
-        if ($this->_useLua) {
-            $sArgs = array(
-                self::PREFIX_KEY,
-                self::FIELD_DATA,
-                self::FIELD_TAGS,
-                self::FIELD_MTIME,
-                self::FIELD_INF,
-                self::SET_TAGS,
-                self::PREFIX_TAG_IDS,
-                self::SET_IDS,
-                $id,
-                $this->_encodeData($data, $this->_compressData),
-                $this->_encodeData(implode(',',$tags), $this->_compressTags),
-                time(),
-                $lifetime ? 0 : 1,
-                min($lifetime, self::MAX_LIFETIME),
-                $this->_notMatchingTags ? 1 : 0
-            );
-
-            $res = $this->_redis->evalSha(self::LUA_SAVE_SH1, $tags, $sArgs);
-            if (is_null($res)) {
-                $script =
-                    "local oldTags = redis.call('HGET', ARGV[1]..ARGV[9], ARGV[3]) ".
-                    "redis.call('HMSET', ARGV[1]..ARGV[9], ARGV[2], ARGV[10], ARGV[3], ARGV[11], ARGV[4], ARGV[12], ARGV[5], ARGV[13]) ".
-                    "if (ARGV[13] == '0') then ".
-                        "redis.call('EXPIRE', ARGV[1]..ARGV[9], ARGV[14]) ".
-                    "end ".
-                    "if next(KEYS) ~= nil then ".
-                        "redis.call('SADD', ARGV[6], unpack(KEYS)) ".
-                        "for _, tagname in ipairs(KEYS) do ".
-                            "redis.call('SADD', ARGV[7]..tagname, ARGV[9]) ".
-                        "end ".
-                    "end ".
-                    "if (ARGV[15] == '1') then ".
-                        "redis.call('SADD', ARGV[8], ARGV[9]) ".
-                    "end ".
-                    "if (oldTags ~= false) then ".
-                        "return oldTags ".
-                    "else ".
-                        "return '' ".
-                    "end";
-                $res = $this->_redis->eval($script, $tags, $sArgs);
-            }
-
-            // Process removed tags if cache entry already existed
-            if ($res) {
-                $oldTags = explode(',', $this->_decodeData($res));
-                if ($remTags = ($oldTags ? array_diff($oldTags, $tags) : FALSE))
-                {
-                    // Update the id list for each tag
-                    foreach($remTags as $tag)
-                    {
-                        $this->_redis->sRem(self::PREFIX_TAG_IDS . $tag, $id);
-                    }
-                }
-            }
-
-            return TRUE;
-        }
-
+		
         // Get list of tags previously assigned
         $oldTags = $this->_decodeData($this->_redis->hGet(self::PREFIX_KEY.$id, self::FIELD_TAGS));
         $oldTags = $oldTags ? explode(',', $oldTags) : array();
 
-        $this->_redis->pipeline()->multi();
+        $this->pipeline();
 
         // Set the data
         $result = $this->_redis->hMSet(self::PREFIX_KEY.$id, array(
@@ -313,19 +269,21 @@ class Cm_Cache_Backend_Redis extends Zend_Cache_Backend implements Zend_Cache_Ba
             throw new CredisException("Could not set cache key $id");
         }
 
-        // Set expiration if specified
-        if ($lifetime) {
-          $this->_redis->expire(self::PREFIX_KEY.$id, min($lifetime, self::MAX_LIFETIME));
-        }
+
+
+        // Always expire so the volatile-* eviction policies may be safely used, otherwise
+        // there is a risk that tag data could be evicted.
+        $this->_redis->expire(self::PREFIX_KEY.$id, $lifetime ? $lifetime : $this->_lifetimelimit);
+
 
         // Process added tags
-        if ($tags)
+        if ($addTags = ($oldTags ? array_diff($tags, $oldTags) : $tags))
         {
             // Update the list with all the tags
-            $this->_redis->sAdd( self::SET_TAGS, $tags);
+            $this->_redis->sAdd( self::SET_TAGS, $addTags);
 
             // Update the id list for each tag
-            foreach($tags as $tag)
+            foreach($addTags as $tag)
             {
                 $this->_redis->sAdd(self::PREFIX_TAG_IDS . $tag, $id);
             }
@@ -346,23 +304,31 @@ class Cm_Cache_Backend_Redis extends Zend_Cache_Backend implements Zend_Cache_Ba
             $this->_redis->sAdd(self::SET_IDS, $id);
         }
 
-        $this->_redis->exec();
+        $this->exec_pipeline();
 
         return TRUE;
     }
 
+    public function save($data, $id = null, $tags = array(), $specificLifetime = false, $priority = 8)
+    {
+        //Mage::log("Saving $id");
+        $res =  $this->_save($data, $id, $tags, $specificLifetime, $priority);
+        $this->unlock($id."-".self::LOCK);
+        $this->_redis->del(self::PREFIX_KEY.$id. "-".self::STALE);
+        return $res;
+    }
     /**
      * Remove a cache record
      *
      * @param  string $id Cache id
      * @return boolean True if no problem
      */
-    public function remove($id)
+    public function _remove($id)
     {
         // Get list of tags for this id
         $tags = explode(',', $this->_decodeData($this->_redis->hGet(self::PREFIX_KEY.$id, self::FIELD_TAGS)));
 
-        $this->_redis->pipeline()->multi();
+       $this->pipeline();
 
         // Remove data
         $this->_redis->del(self::PREFIX_KEY.$id);
@@ -377,10 +343,75 @@ class Cm_Cache_Backend_Redis extends Zend_Cache_Backend implements Zend_Cache_Ba
             $this->_redis->sRem(self::PREFIX_TAG_IDS . $tag, $id);
         }
 
-        $result = $this->_redis->exec();
+        $this->exec_pipeline();
 
-        return (bool) $result[0];
+        return $result;
     }
+	public function remove($id, $level = 0){
+        switch($level){
+            case 0:
+            case 1:
+                $this->invalidate($id);
+                break;
+            case 2:
+                $this->_remove($id);
+                break;
+        }
+    }
+	
+    public function invalidateAll($ids){
+        $this->pipeline();
+        foreach($ids as $id){
+            $this->invalidate($id);
+        }
+        $this->exec_pipeline();
+    }
+    public function invalidate($id){
+        $this->pipeline();
+        $this->_redis->del(self::PREFIX_KEY.$id. "-".self::LOCK); //Remove the lock, the cached element probably needs recaching again
+        $this->_redis->hSetNx(self::PREFIX_KEY.$id, self::FIELD_DATA, false); //Set something to the value, if it was already deleted
+        $this->_redis->renameNx(self::PREFIX_KEY.$id, self::PREFIX_KEY.$id. "-".self::STALE); //Rename if the new one does not exist
+        $this->_redis->del(self::PREFIX_KEY.$id); //Delete the old key, in case the rename didn't work
+        $this->_redis->expire(self::PREFIX_KEY.$id. "-".self::STALE, 300);   //Add an expires to the new key to make sure it will go away
+        $this->exec_pipeline();
+    }
+
+    public function isLocked($id){
+        return $this->_redis->exists(self::PREFIX_KEY.$id);
+    }
+    public function lock($id, $time=300){
+         if (isset($this->locks[$id])){
+             return true; //We already have that lock
+         }
+         $lock = $this->_redis->setNx(self::PREFIX_KEY.$id, true);
+         if ($lock){
+            $this->locks[$id] = true;
+            $this->_redis->expire(self::PREFIX_KEY.$id, $time);
+         }
+         return $lock;
+    }
+    public function unlock($id){
+         $lock = $this->_redis->del(self::PREFIX_KEY.$id);
+         unset($this->locks[$id]);
+         return $lock;
+    }
+   
+    public function pipeline(){
+        if ($this->pipe_count==0){
+            $this->_redis->pipeline()->multi();
+        }
+        $this->pipe_count++;
+    }
+    public function exec_pipeline(){
+        $this->pipe_count--;
+        if ($this->pipe_count==0){
+            $result = $this->_redis->exec();
+            
+            return isset($result[0]) ? true : false;
+        }
+        return true;
+    }
+
 
     /**
      * @param array $tags
@@ -390,17 +421,17 @@ class Cm_Cache_Backend_Redis extends Zend_Cache_Backend implements Zend_Cache_Ba
         $ids = $this->getIdsNotMatchingTags($tags);
         if($ids)
         {
-            $this->_redis->pipeline()->multi();
+            $this->pipeline();
 
             // Remove data
-            $this->_redis->del( $this->_preprocessIds($ids));
+            $this->invalidateAll( $ids);
 
             // Remove ids from list of all ids
             if($this->_notMatchingTags) {
                 $this->_redis->sRem( self::SET_IDS, $ids);
             }
 
-            $this->_redis->exec();
+            $this->exec_pipeline();
         }
     }
 
@@ -412,17 +443,15 @@ class Cm_Cache_Backend_Redis extends Zend_Cache_Backend implements Zend_Cache_Ba
         $ids = $this->getIdsMatchingTags($tags);
         if($ids)
         {
-            $this->_redis->pipeline()->multi();
+            $this->pipeline();
 
             // Remove data
-            $this->_redis->del( $this->_preprocessIds($ids));
+            $this->invalidateAll( $ids);
 
             // Remove ids from list of all ids
-            if($this->_notMatchingTags) {
-                $this->_redis->sRem( self::SET_IDS, $ids);
-            }
 
-            $this->_redis->exec();
+
+            $this->exec_pipeline();
         }
     }
 
@@ -451,30 +480,31 @@ class Cm_Cache_Backend_Redis extends Zend_Cache_Backend implements Zend_Cache_Ba
                 $this->_redis->eval($script, $pTags, $sArgs);
             }
             return;
+
+
+
+
+
+
+
+
+
+
+
+
         }
 
         $ids = $this->getIdsMatchingAnyTags($tags);
 
-        $this->_redis->pipeline()->multi();
+$this->pipeline();
 
         if($ids)
         {
-            // Remove data
-            $this->_redis->del( $this->_preprocessIds($ids));
+       
+            $this->invalidateAll( $ids);
 
-            // Remove ids from list of all ids
-            if($this->_notMatchingTags) {
-                $this->_redis->sRem( self::SET_IDS, $ids);
-            }
         }
-
-        // Remove tag id lists
-        $this->_redis->del( $this->_preprocessTagIds($tags));
-
-        // Remove tags from list of tags
-        $this->_redis->sRem( self::SET_TAGS, $tags);
-
-        $this->_redis->exec();
+		$this->exec_pipeline();
     }
 
     /**
@@ -642,6 +672,10 @@ class Cm_Cache_Backend_Redis extends Zend_Cache_Backend implements Zend_Cache_Ba
 
                     $this->_removeByNotMatchingTags($tags);
                     break;
+
+
+
+
 
                 case Zend_Cache::CLEANING_MODE_MATCHING_ANY_TAG:
 

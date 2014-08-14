@@ -84,12 +84,12 @@
 		 <watchtower>
             <blocks>
                <supervisor/>
-           <!--     <beanstalkd/>-->
-        <!--        <indexing/>-->
+                <beanstalkd/>
+                <indexing/>
               <redis/>
                 <dbstatus/>
-          <!--         <validations/>
-            -->
+                   <validations/>
+            
             </blocks>
     </watchtower>
     </global>

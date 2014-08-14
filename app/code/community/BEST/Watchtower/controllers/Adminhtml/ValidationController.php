@@ -24,7 +24,7 @@ class BEST_Watchtower_Adminhtml_ValidationController extends BEST_Watchtower_Con
         return $this;
     }
 
-    private function renderValidation($code, $small, $all)
+    private function renderValidation($code, $small, $all = false)
     {
 
         $val = Mage::helper("watchtower")->getValidation($code);

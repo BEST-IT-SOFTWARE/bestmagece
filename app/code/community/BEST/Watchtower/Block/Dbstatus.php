@@ -60,6 +60,7 @@ class BEST_Watchtower_Block_Dbstatus extends BEST_Watchtower_Block_Abstract
 
     function getTable($title, $rows)
     {
+        if(!isset($rows[0])) return false;
         $table = "<table><tr><th>$title</th></tr>";
         array_unshift($rows, array_keys($rows[0]));
         foreach ($rows as $data) {
